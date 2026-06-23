@@ -1,0 +1,13 @@
+[Unit]
+Description=xe_fan_dashboard - Web Dashboard for Fan Control Monitor
+After=network.target
+
+[Service]
+Type=simple
+Environment=INSTALL_ROOT=/opt/xe-fan-patch
+ExecStart=/usr/bin/python3 ${INSTALL_ROOT}/src/monitor/xe_fan_dashboard.py --background-check
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""xe_fanctl - Fan control daemon for Intel Arc B580 GPU.
+
+Reads GPU package temperature and adjusts fan speed based on a
+configurable temperature-to-PWM curve with linear interpolation
+and hysteresis. Supports multiple fan control methods:
+
+  - kernel:      /sys/kernel/xe_fan/pwm1 (out-of-tree kernel module)
+  - userspace:   xe_pcode_probe --write-duty N --force
+  - motherboard: /sys/class/hwmon/hwmonN/pwmM (physical fan redirect)
+
+Usage:
+  xe_fanctl [--config PATH] [--dry-run] [--once]
+  xe_fanctl --version
+  xe_fanctl --help
+"""
+
+import argparse
+import configparser
+import logging
+import logging.handlers
+import os
+import signal
+import subprocess
+import sys
+import time
+
+PROG_NAME = "xe_fanctl"
+VERSION = "1.0"
+
+DEFAULT_CONFIG_PATHS = [
+    "/etc/xe_fanctl.conf",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "xe_fanctl.conf"),
+]
+
+PID_FILE = "/run/xe_fanctl.pid"
+HWMON_BASE = "/sys/class/hwmon"
+KERNEL_BASE = "/sys/kernel/xe_fan"
+HWMON_TEMP_PATH = os.path.join(HWMON_BASE, "hwmon2", "temp2_input")
+KERNEL_TEMP_PATH = os.path.join(KERNEL_BASE, "temp1_input")
+
+EXIT_SUCCESS = 0
+EXIT_FAILURE = 1
+
+
+# ---------------------------------------------------------------------------
+# Fan curve with interpolation and hysteresis
+# ---------------------------------------------------------------------------
+
+class FanCurve:
+    """Temperature-to-PWM curve with linear interpolation and hysteresis.
+
+    Points are (temp_celsius, pwm_duty) pairs. For a given temperature the
+    curve linearly interpolates between the two surrounding points. Below the
+    lowest point the lowest PWM is returned; above the highest point the
+    highest PWM is returned.
+
+    Hysteresis prevents rapid oscillation: when the target PWM would decrease,
+    the decrease is only applied if the temperature has fallen by at least
+    hysteresis degrees below the temperature at which the PWM was last
+    increased.
+    """
+
+    def __init__(self, points, hysteresis_deg):
+        self._points = sorted(points)
+        self._hysteresis = hysteresis_deg
+        self._current_pwm = None
+        self._last_increase_temp = None
+
+    @property
+    def points(self):
+        return list(self._points)
+
+    def _interpolate(self, temp_c):
+        if not self._points:
+            return 0
+        if temp_c <= self._points[0][0]:
+            return self._points[0][1]
+        if temp_c >= self._points[-1][0]:
+            return self._points[-1][1]
+        for i in range(len(self._points) - 1):
+            t1, p1 = self._points[i]
+            t2, p2 = self._points[i + 1]
+            if t1 <= temp_c <= t2:
+                if t2 == t1:
+                    return p2
+                ratio = (temp_c - t1) / (t2 - t1)
+                return int(round(p1 + ratio * (p2 - p1)))
+        return self._points[-1][1]
+
+    def compute(self, temp_c):
+        """Return the PWM duty (0-255) for the given temperature."""
+        target = self._interpolate(temp_c)
+        target = max(0, min(255, target))
+
+        if self._current_pwm is None:
+            self._current_pwm = target
+            self._last_increase_temp = temp_c
+            return target
+
+        if target > self._current_pwm:
+            self._current_pwm = target
+            self._last_increase_temp = temp_c
+            return target
+
+        if target < self._current_pwm:
+            threshold = self._last_increase_temp - self._hysteresis
+            if temp_c <= threshold:
+                self._current_pwm = target
+                return target
+            return self._current_pwm
+
+        return self._current_pwm
+
+    def reset(self):
+        self._current_pwm = None
+        self._last_increase_temp = None
+
+
+# ---------------------------------------------------------------------------
+# Temperature reading
+# ---------------------------------------------------------------------------
+
+class TemperatureReader:
+    """Reads GPU package temperature from hwmon or kernel sysfs.
+
+    Both sources return millidegrees Celsius; the reader converts to degrees.
+    If the primary source is unavailable the reader falls back to the other.
+    """
+
+    def __init__(self, source, logger):
+        self._source = source
+        self._logger = logger
+        self._fallback_used = False
+
+    @property
+    def source_name(self):
+        if self._fallback_used:
+            return self._source + " (fallback)"
+        return self._source
+
+    @property
+    def _path(self):
+        if self._source == "kernel":
+            return KERNEL_TEMP_PATH
+        return HWMON_TEMP_PATH
+
+    @property
+    def _fallback_path(self):
+        if self._source == "kernel":
+            return HWMON_TEMP_PATH
+        return KERNEL_TEMP_PATH
+
+    def read(self):
+        """Return temperature in degrees Celsius, or None on failure."""
+        temp = self._read_path(self._path)
+        if temp is not None:
+            return temp
+
+        if not self._fallback_used:
+            self._logger.warning(
+                "Primary temp source '%s' unavailable, trying fallback",
+                self._source,
+            )
+            temp = self._read_path(self._fallback_path)
+            if temp is not None:
+                self._fallback_used = True
+                self._logger.info("Using fallback temperature source")
+                return temp
+
+        self._logger.error("No temperature source available")
+        return None
+
+    def _read_path(self, path):
+        try:
+            with open(path, "r") as fh:
+                millideg = int(fh.read().strip())
+            return millideg / 1000.0
+        except (IOError, OSError, ValueError) as exc:
+            self._logger.warning("Failed to read %s: %s", path, exc)
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Fan controller backends
+# ---------------------------------------------------------------------------
+
+class FanController:
+    """Base class for fan control backends."""
+
+    def __init__(self, logger, dry_run=False):
+        self._logger = logger
+        self._dry_run = dry_run
+        self._enabled = False
+
+    @property
+    def name(self):
+        raise NotImplementedError
+
+    def enable(self):
+        """Enable manual fan control. Return True on success."""
+        raise NotImplementedError
+
+    def set_pwm(self, pwm):
+        """Write PWM duty (0-255). Return True on success."""
+        raise NotImplementedError
+
+    def disable(self):
+        """Return the fan to automatic control."""
+        raise NotImplementedError
+
+
+class KernelFanController(FanController):
+    """Fan control via /sys/kernel/xe_fan/pwm1 (out-of-tree kernel module)."""
+
+    def __init__(self, logger, dry_run=False, write_subcmd=None):
+        super().__init__(logger, dry_run)
+        self._pwm_path = os.path.join(KERNEL_BASE, "pwm1")
+        self._enable_path = os.path.join(KERNEL_BASE, "pwm1_enable")
+        self._subcmd_path = os.path.join(KERNEL_BASE, "write_subcmd")
+        self._write_subcmd = write_subcmd
+
+    @property
+    def name(self):
+        return "kernel"
+
+    def enable(self):
+        if self._dry_run:
+            self._logger.info("[dry-run] Would enable kernel manual fan control")
+            return True
+
+        if self._write_subcmd is not None:
+            self._set_write_subcmd(self._write_subcmd)
+
+        try:
+            self._sysfs_write(self._enable_path, "1")
+            self._enabled = True
+            self._logger.info("Kernel manual fan control enabled")
+            return True
+        except (IOError, OSError) as exc:
+            self._logger.error("Failed to enable kernel fan control: %s", exc)
+            return False
+
+    def _set_write_subcmd(self, subcmd):
+        try:
+            self._sysfs_write(self._subcmd_path, str(subcmd))
+            self._logger.info("Kernel write_subcmd set to %s", subcmd)
+        except (IOError, OSError) as exc:
+            self._logger.warning("Failed to set write_subcmd: %s", exc)
+
+    def set_pwm(self, pwm):
+        pwm = max(0, min(255, pwm))
+        if self._dry_run:
+            self._logger.info("[dry-run] Would write PWM %d to %s", pwm, self._pwm_path)
+            return True
+        try:
+            self._sysfs_write(self._pwm_path, str(pwm))
+            return True
+        except (IOError, OSError) as exc:
+            self._logger.error("Failed to write PWM %d to kernel: %s", pwm, exc)
+            return False
+
+    def disable(self):
+        if self._dry_run:
+            self._logger.info("[dry-run] Would return fan to firmware auto mode")
+            return
+        if not self._enabled:
+            return
+        try:
+            self._sysfs_write(self._pwm_path, "0")
+            self._sysfs_write(self._enable_path, "0")
+            self._logger.info("Fan returned to firmware auto mode")
+        except (IOError, OSError) as exc:
+            self._logger.warning("Failed to return fan to auto mode: %s", exc)
+        self._enabled = False
+
+    @staticmethod
+    def _sysfs_write(path, value):
+        with open(path, "w") as fh:
+            fh.write(str(value) + "\n")
+
+
+class UserspaceFanController(FanController):
+    """Fan control via the xe_pcode_probe userspace tool.
+
+    Calls xe_pcode_probe --write-duty N --force to write the fan duty cycle
+    through the PCODE mailbox. The tool probes all FAN_SPEED_CONTROL
+    subcommands and writes to whichever accepts the value.
+    """
+
+    def __init__(self, logger, tool_path, write_subcmd, dry_run=False):
+        super().__init__(logger, dry_run)
+        self._tool_path = tool_path
+        self._write_subcmd = write_subcmd
+
+    @property
+    def name(self):
+        return "userspace"
+
+    def enable(self):
+        if self._dry_run:
+            self._logger.info("[dry-run] Would enable userspace fan control")
+            return True
+        if not os.path.isfile(self._tool_path):
+            self._logger.error("Userspace tool not found: %s", self._tool_path)
+            return False
+        if not os.access(self._tool_path, os.X_OK):
+            self._logger.error("Userspace tool not executable: %s", self._tool_path)
+            return False
+        self._enabled = True
+        self._logger.info("Userspace fan control enabled (tool: %s)", self._tool_path)
+        if self._write_subcmd is not None:
+            self._logger.info("Using write subcommand: %s", self._write_subcmd)
+        return True
+
+    def set_pwm(self, pwm):
+        pwm = max(0, min(255, pwm))
+        if self._dry_run:
+            self._logger.info(
+                "[dry-run] Would call %s --write-duty %d --force",
+                self._tool_path, pwm,
+            )
+            return True
+        try:
+            result = subprocess.run(
+                [self._tool_path, "--write-duty", str(pwm), "--force"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0 and "WRITE SUCCESS" in result.stdout:
+                self._logger.debug("Userspace tool succeeded for PWM %d", pwm)
+                return True
+            combined = (result.stderr or "").strip()
+            if not combined:
+                combined = (result.stdout or "").strip()
+            self._logger.error(
+                "Userspace tool failed (rc=%d): %s", result.returncode, combined,
+            )
+            return False
+        except subprocess.TimeoutExpired:
+            self._logger.error("Userspace tool timed out (PWM %d)", pwm)
+            return False
+        except (IOError, OSError) as exc:
+            self._logger.error("Failed to run userspace tool: %s", exc)
+            return False
+
+    def disable(self):
+        if self._dry_run:
+            self._logger.info("[dry-run] Would return fan to auto mode (duty=0)")
+            return
+        if not self._enabled:
+            return
+        try:
+            subprocess.run(
+                [self._tool_path, "--write-duty", "0", "--force"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self._logger.info("Fan returned to auto mode (duty=0)")
+        except (IOError, OSError, subprocess.TimeoutExpired) as exc:
+            self._logger.warning("Failed to return fan to auto mode: %s", exc)
+        self._enabled = False
+
+
+class MotherboardFanController(FanController):
+    """Fan control via a motherboard PWM header (physical fan redirect).
+
+    Uses the standard Linux hwmon PWM interface:
+      pwmN_enable: 1 = manual, 2 = auto (chip-controlled)
+      pwmN: duty cycle 0-255 (when in manual mode)
+    """
+
+    def __init__(self, logger, pwm_device, pwm_channel, dry_run=False):
+        super().__init__(logger, dry_run)
+        self._pwm_path = os.path.join(HWMON_BASE, pwm_device, "pwm" + str(pwm_channel))
+        self._enable_path = os.path.join(
+            HWMON_BASE, pwm_device, "pwm" + str(pwm_channel) + "_enable",
+        )
+        self._pwm_device = pwm_device
+        self._pwm_channel = pwm_channel
+
+    @property
+    def name(self):
+        return "motherboard"
+
+    def enable(self):
+        if self._dry_run:
+            self._logger.info(
+                "[dry-run] Would enable motherboard PWM at %s", self._pwm_path,
+            )
+            return True
+        try:
+            self._sysfs_write(self._enable_path, "1")
+            self._enabled = True
+            self._logger.info(
+                "Motherboard PWM enabled (manual mode): %s", self._pwm_path,
+            )
+            return True
+        except (IOError, OSError) as exc:
+            self._logger.error("Failed to enable motherboard PWM: %s", exc)
+            return False
+
+    def set_pwm(self, pwm):
+        pwm = max(0, min(255, pwm))
+        if self._dry_run:
+            self._logger.info(
+                "[dry-run] Would write PWM %d to %s", pwm, self._pwm_path,
+            )
+            return True
+        try:
+            self._sysfs_write(self._pwm_path, str(pwm))
+            return True
+        except (IOError, OSError) as exc:
+            self._logger.error("Failed to write PWM %d to motherboard: %s", pwm, exc)
+            return False
+
+    def disable(self):
+        if self._dry_run:
+            self._logger.info("[dry-run] Would return motherboard fan to auto mode")
+            return
+        if not self._enabled:
+            return
+        try:
+            self._sysfs_write(self._enable_path, "2")
+            self._logger.info("Motherboard fan returned to auto mode")
+        except (IOError, OSError):
+            try:
+                self._sysfs_write(self._enable_path, "0")
+                self._logger.info("Motherboard fan disabled")
+            except (IOError, OSError) as exc:
+                self._logger.warning(
+                    "Failed to return motherboard fan to auto: %s", exc,
+                )
+        self._enabled = False
+
+    @staticmethod
+    def _sysfs_write(path, value):
+        with open(path, "w") as fh:
+            fh.write(str(value) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Main daemon
+# ---------------------------------------------------------------------------
+
+class XeFanDaemon:
+    """Main fan control daemon coordinating temperature reading, curve
+    evaluation, and PWM writing through the selected backend."""
+
+    def __init__(self, config_path, dry_run=False, once=False):
+        self._config_path = config_path
+        self._dry_run = dry_run
+        self._once = once
+        self._running = False
+        self._logger = logging.getLogger(PROG_NAME)
+        self._config = None
+        self._curve = None
+        self._temp_reader = None
+        self._controller = None
+        self._interval = 2.0
+
+    # -- configuration -------------------------------------------------------
+
+    def _load_config(self):
+        if not os.path.isfile(self._config_path):
+            self._logger.error("Config file not found: %s", self._config_path)
+            return False
+        config = configparser.ConfigParser(
+            inline_comment_prefixes=("#",),
+            comment_prefixes=("#", ";"),
+        )
+        config.optionxform = str
+        try:
+            config.read(self._config_path)
+        except configparser.Error as exc:
+            self._logger.error("Failed to parse config: %s", exc)
+            return False
+        self._config = config
+        return True
+
+    def _parse_curve(self):
+        if "curve" not in self._config:
+            self._logger.error("No [curve] section in config")
+            return False
+
+        points = []
+        for key in self._config["curve"]:
+            raw_val = self._config["curve"][key]
+            try:
+                temp = int(key)
+                pwm = int(raw_val)
+            except ValueError:
+                self._logger.warning(
+                    "Skipping invalid curve entry: %s = %s", key, raw_val,
+                )
+                continue
+            if pwm < 0 or pwm > 255:
+                orig = pwm
+                pwm = max(0, min(255, pwm))
+                self._logger.warning(
+                    "PWM %d out of range for temp %d, clamped to %d",
+                    orig, temp, pwm,
+                )
+            points.append((temp, pwm))
+
+        if not points:
+            self._logger.error("No valid curve points found in config")
+            return False
+
+        hysteresis = self._config.getfloat("general", "hysteresis", fallback=3.0)
+        self._curve = FanCurve(points, hysteresis)
+        self._logger.info(
+            "Fan curve loaded: %d points, hysteresis=%.1fC", len(points), hysteresis,
+        )
+        for t, p in sorted(points):
+            self._logger.debug("  curve point: %dC -> %d/255", t, p)
+        return True
+
+    # -- method detection ----------------------------------------------------
+
+    def _detect_method(self):
+        method = self._config.get("general", "method", fallback="auto").lower()
+
+        if method == "auto":
+            if self._check_kernel_available():
+                method = "kernel"
+            elif self._check_userspace_available():
+                method = "userspace"
+            elif self._check_motherboard_available():
+                method = "motherboard"
+            else:
+                self._logger.error("No fan control method available")
+                return None
+            self._logger.info("Auto-detected fan control method: %s", method)
+
+        if method == "kernel":
+            self._controller = self._make_kernel_controller()
+        elif method == "userspace":
+            self._controller = self._make_userspace_controller()
+        elif method == "motherboard":
+            self._controller = self._make_motherboard_controller()
+        else:
+            self._logger.error("Unknown method: %s", method)
+            return None
+
+        return method
+
+    def _make_kernel_controller(self):
+        write_subcmd = self._resolve_write_subcmd()
+        return KernelFanController(self._logger, self._dry_run, write_subcmd)
+
+    def _make_userspace_controller(self):
+        tool_path = self._config.get(
+            "userspace", "tool_path",
+            fallback=os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "userspace", "xe_pcode_probe",
+            ),
+        )
+        write_subcmd = self._resolve_write_subcmd()
+        return UserspaceFanController(self._logger, tool_path, write_subcmd, self._dry_run)
+
+    def _make_motherboard_controller(self):
+        pwm_device = self._config.get("motherboard", "pwm_device", fallback="hwmon3")
+        pwm_channel = self._config.getint("motherboard", "pwm_channel", fallback=3)
+        return MotherboardFanController(
+            self._logger, pwm_device, pwm_channel, self._dry_run,
+        )
+
+    def _resolve_write_subcmd(self):
+        raw = self._config.get("userspace", "write_subcmd", fallback="auto")
+        raw = raw.strip()
+        if raw.lower() == "auto":
+            subcmd_path = os.path.join(KERNEL_BASE, "write_subcmd")
+            if os.path.isfile(subcmd_path):
+                try:
+                    with open(subcmd_path, "r") as fh:
+                        val = fh.read().strip()
+                    if val and not val.startswith("-1") and not val.startswith("not"):
+                        try:
+                            return int(val, 0)
+                        except ValueError:
+                            pass
+                except (IOError, OSError):
+                    pass
+            return None
+        try:
+            return int(raw, 0)
+        except ValueError:
+            self._logger.warning("Invalid write_subcmd value: %s, ignoring", raw)
+            return None
+
+    def _check_kernel_available(self):
+        pwm_path = os.path.join(KERNEL_BASE, "pwm1")
+        return os.path.isfile(pwm_path) and os.access(pwm_path, os.W_OK)
+
+    def _check_userspace_available(self):
+        tool_path = self._config.get(
+            "userspace", "tool_path",
+            fallback=os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "userspace", "xe_pcode_probe",
+            ),
+        )
+        if not tool_path or not os.path.isfile(tool_path):
+            return False
+        if not os.access(tool_path, os.X_OK):
+            return False
+        return True
+
+    def _check_motherboard_available(self):
+        pwm_device = self._config.get("motherboard", "pwm_device", fallback="hwmon3")
+        pwm_channel = self._config.getint("motherboard", "pwm_channel", fallback=3)
+        pwm_path = os.path.join(HWMON_BASE, pwm_device, "pwm" + str(pwm_channel))
+        return os.path.isfile(pwm_path) and os.access(pwm_path, os.W_OK)
+
+    # -- temperature reader --------------------------------------------------
+
+    def _setup_temperature_reader(self):
+        temp_source = self._config.get(
+            "general", "temp_source", fallback="hwmon",
+        ).lower()
+        self._temp_reader = TemperatureReader(temp_source, self._logger)
+        temp = self._temp_reader.read()
+        if temp is None:
+            self._logger.error("No temperature source available")
+            return False
+        self._logger.info(
+            "Temperature source: %s (%.1fC)", self._temp_reader.source_name, temp,
+        )
+        return True
+
+    # -- PID file ------------------------------------------------------------
+
+    def _check_existing_pid(self):
+        if not os.path.isfile(PID_FILE):
+            return True
+        try:
+            with open(PID_FILE, "r") as fh:
+                old_pid = int(fh.read().strip())
+        except (IOError, OSError, ValueError):
+            self._remove_pid_file()
+            return True
+        try:
+            os.kill(old_pid, 0)
+            self._logger.error("Daemon already running (PID %d)", old_pid)
+            return False
+        except OSError:
+            self._logger.warning("Stale PID file found (PID %d), removing", old_pid)
+            self._remove_pid_file()
+            return True
+
+    def _write_pid_file(self):
+        try:
+            with open(PID_FILE, "w") as fh:
+                fh.write(str(os.getpid()) + "\n")
+        except (IOError, OSError) as exc:
+            self._logger.warning("Failed to write PID file %s: %s", PID_FILE, exc)
+
+    def _remove_pid_file(self):
+        try:
+            os.unlink(PID_FILE)
+        except (IOError, OSError):
+            pass
+
+    # -- logging -------------------------------------------------------------
+
+    def _setup_logging(self, level_name):
+        levels = {
+            "debug": logging.DEBUG,
+            "info": logging.INFO,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+        }
+        level = levels.get(level_name.lower(), logging.INFO)
+
+        self._logger.setLevel(level)
+        self._logger.handlers.clear()
+
+        if self._dry_run or self._once:
+            handler = logging.StreamHandler(sys.stderr)
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s " + PROG_NAME + "[%(process)d] %(levelname)s: %(message)s"
+            ))
+            self._logger.addHandler(handler)
+        else:
+            use_syslog = False
+            try:
+                handler = logging.handlers.SysLogHandler(address="/dev/log")
+                handler.setFormatter(logging.Formatter(
+                    PROG_NAME + "[%(process)d]: %(message)s"
+                ))
+                self._logger.addHandler(handler)
+                use_syslog = True
+            except (IOError, OSError):
+                pass
+            if not use_syslog:
+                handler = logging.StreamHandler(sys.stderr)
+                handler.setFormatter(logging.Formatter(
+                    "%(asctime)s " + PROG_NAME + "[%(process)d] %(levelname)s: %(message)s"
+                ))
+                self._logger.addHandler(handler)
+
+    # -- signal handling -----------------------------------------------------
+
+    def _signal_handler(self, signum, frame):
+        sig_name = signal.Signals(signum).name
+        self._logger.info("Received %s, shutting down", sig_name)
+        self._running = False
+
+    # -- main loop -----------------------------------------------------------
+
+    def _poll(self):
+        temp = self._temp_reader.read()
+        if temp is None:
+            return
+
+        pwm = self._curve.compute(temp)
+        self._logger.debug("Temp: %.1fC -> PWM: %d/255", temp, pwm)
+
+        if not self._controller.set_pwm(pwm):
+            self._logger.warning(
+                "PWM write failed (temp=%.1fC, pwm=%d)", temp, pwm,
+            )
+
+    def _cleanup(self):
+        self._logger.info("Cleaning up")
+        if self._controller is not None:
+            self._controller.disable()
+        self._remove_pid_file()
+        self._logger.info("Daemon stopped")
+
+    def run(self):
+        self._setup_logging("info")
+
+        if not self._load_config():
+            return EXIT_FAILURE
+
+        log_level = self._config.get("general", "log_level", fallback="info")
+        self._setup_logging(log_level)
+
+        self._logger.info("Starting %s v%s", PROG_NAME, VERSION)
+
+        if not self._dry_run and os.geteuid() != 0:
+            self._logger.error("Must run as root (need access to hwmon and PCI resources)")
+            return EXIT_FAILURE
+
+        if not self._check_existing_pid():
+            return EXIT_FAILURE
+
+        if not self._parse_curve():
+            return EXIT_FAILURE
+
+        if not self._setup_temperature_reader():
+            return EXIT_FAILURE
+
+        method = self._detect_method()
+        if method is None:
+            return EXIT_FAILURE
+
+        self._interval = self._config.getfloat("general", "interval", fallback=2.0)
+
+        if not self._controller.enable():
+            self._logger.error("Failed to enable fan control method: %s", method)
+            return EXIT_FAILURE
+
+        if not self._dry_run:
+            self._write_pid_file()
+
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+        self._running = True
+        self._logger.info(
+            "Daemon started (method=%s, interval=%.1fs, dry_run=%s, once=%s)",
+            method, self._interval, self._dry_run, self._once,
+        )
+
+        while self._running:
+            self._poll()
+            if self._once:
+                self._logger.info("Single poll complete, exiting")
+                break
+            time.sleep(self._interval)
+
+        self._cleanup()
+        return EXIT_SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=PROG_NAME,
+        description="Fan control daemon for Intel Arc B580 GPU",
+    )
+    parser.add_argument(
+        "--config", "-c", metavar="PATH",
+        help="path to config file (default: /etc/xe_fanctl.conf or adjacent to script)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="log what would be done without actually writing PWM",
+    )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="perform a single poll then exit",
+    )
+    parser.add_argument(
+        "--version", "-V", action="version",
+        version="%(prog)s v" + VERSION,
+    )
+    args = parser.parse_args()
+
+    config_path = args.config
+    if not config_path:
+        for p in DEFAULT_CONFIG_PATHS:
+            if os.path.isfile(p):
+                config_path = p
+                break
+        if not config_path:
+            print(
+                "Error: no config file found. Tried: " + ", ".join(DEFAULT_CONFIG_PATHS),
+                file=sys.stderr,
+            )
+            return EXIT_FAILURE
+
+    daemon = XeFanDaemon(config_path, dry_run=args.dry_run, once=args.once)
+    return daemon.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

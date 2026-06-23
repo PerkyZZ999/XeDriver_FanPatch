@@ -1,0 +1,71 @@
+{
+  "_description": "CoolerControl profile for ASRock Challenger Arc B580 GPU fan redirected to a GIGABYTE B550M motherboard PWM header (it8689 / hwmon3). Import via CoolerControl UI: Settings → Import, or place in ~/.config/coolercontrol/profiles/.",
+  "_hardware_context": {
+    "gpu": "Intel Arc B580 (Battlemage G21), PCI 8086:e20b, ASRock Challenger",
+    "gpu_hwmon": "hwmon2 (name=xe)",
+    "gpu_temp_sensor": "temp2_input (package temperature)",
+    "motherboard": "GIGABYTE B550M Gaming X WiFi 6",
+    "super_io": "ITE IT8689 (hwmon3, pwm1-pwm5)",
+    "pwm_channel": "pwm3 (SYS_FAN2 — adjust to your header)",
+    "fan_curve": "30C→0%, 40C→31%, 50C→47%, 60C→63%, 70C→78%, 80C→100%"
+  },
+  "profiles": [
+    {
+      "name": "B580 GPU Fan",
+      "description": "GPU package temperature drives motherboard PWM header for the redirected Arc B580 fan.",
+      "enabled": true,
+      "interpolation": "linear",
+      "speed_curve": {
+        "x_label": "GPU Temperature (°C)",
+        "y_label": "Fan Duty (%)",
+        "x_unit": "celsius",
+        "y_unit": "percent",
+        "points": [
+          { "x": 30, "y": 0 },
+          { "x": 40, "y": 31 },
+          { "x": 50, "y": 47 },
+          { "x": 60, "y": 63 },
+          { "x": 70, "y": 78 },
+          { "x": 80, "y": 100 }
+        ]
+      }
+    }
+  ],
+  "sensors": [
+    {
+      "name": "B580 GPU Temp",
+      "hwmon": "hwmon2",
+      "hwmon_name": "xe",
+      "channel": "temp2",
+      "file": "/sys/class/hwmon/hwmon2/temp2_input",
+      "unit": "celsius",
+      "scale": 0.001,
+      "offset": 0,
+      "description": "Intel Arc B580 package temperature via xe driver hwmon."
+    }
+  ],
+  "fans": [
+    {
+      "name": "B580 Fan (via SYS_FAN2)",
+      "hwmon": "hwmon3",
+      "hwmon_name": "it8689",
+      "pwm_channel": "pwm3",
+      "pwm_file": "/sys/class/hwmon/hwmon3/pwm3",
+      "pwm_enable_file": "/sys/class/hwmon/hwmon3/pwm3_enable",
+      "fan_rpm_file": "/sys/class/hwmon/hwmon3/fan3_input",
+      "pwm_min": 0,
+      "pwm_max": 255,
+      "profile": "B580 GPU Fan",
+      "temp_sensor": "B580 GPU Temp",
+      "enabled": true,
+      "description": "Motherboard it8689 PWM header controlling the redirected GPU fan."
+    }
+  ],
+  "settings": {
+    "poll_interval_ms": 2000,
+    "hysteresis_celsius": 3,
+    "auto_start": true,
+    "min_pwm_change": 5,
+    "stop_pwm_below_temp": 30
+  }
+}

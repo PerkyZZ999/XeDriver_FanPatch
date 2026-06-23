@@ -1,0 +1,29 @@
+# Build artifacts — userspace
+src/userspace/xe_pcode_probe
+
+# Build artifacts — kernel module
+src/kernel/*.ko
+src/kernel/*.o
+src/kernel/*.mod
+src/kernel/*.mod.c
+src/kernel/*.mod.o
+src/kernel/Module.symvers
+src/kernel/modules.order
+src/kernel/.module-common.o
+src/kernel/.module-common.o.cmd
+src/kernel/.*.cmd
+
+# Runtime / local monitoring data (machine-specific)
+src/monitor/watch_data.json
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

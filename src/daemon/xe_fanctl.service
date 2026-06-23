@@ -1,0 +1,24 @@
+[Unit]
+Description=Intel Arc B580 Fan Control Daemon
+Documentation=https://github.com/YOUR_USERNAME/XeDriver_FanPatch
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+# Edit INSTALL_ROOT before enabling — or copy files to /opt/xe-fan-patch
+Environment=INSTALL_ROOT=/opt/xe-fan-patch
+ExecStart=/bin/sh -c '${INSTALL_ROOT}/src/daemon/xe_fanctl --config ${INSTALL_ROOT}/src/daemon/xe_fanctl.conf'
+ExecStopPost=/bin/rm -f /run/xe_fanctl.pid
+PIDFile=/run/xe_fanctl.pid
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xe_fanctl
+
+[Install]
+WantedBy=multi-user.target

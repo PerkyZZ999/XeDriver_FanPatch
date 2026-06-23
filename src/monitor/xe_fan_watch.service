@@ -1,0 +1,14 @@
+[Unit]
+Description=xe_fan_watch - Intel Arc B580 Fan Control Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Set INSTALL_ROOT to your clone path (e.g. /opt/xe-fan-patch)
+Environment=INSTALL_ROOT=/opt/xe-fan-patch
+ExecStart=/usr/bin/python3 ${INSTALL_ROOT}/src/monitor/xe_fan_watch.py --source all --notify
+User=%i
+
+[Install]
+WantedBy=multi-user.target
