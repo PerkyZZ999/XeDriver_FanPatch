@@ -1,5 +1,23 @@
 # Detailed Implementation Plan: Intel Arc B580 Linux Fan Control
 
+## Resolution (July 3, 2026)
+
+**Fan control is working** via Intel patch series **168027** on a custom `linux-cachyos-xefan` kernel.
+
+| Goal | Status |
+|------|--------|
+| Writable `pwm1` / fan curve sysfs | **Done** — series 168027 |
+| CoolerControl integration | **Done** — Fixed % and Graph profiles verified |
+| Safe rollback | **Done** — stock `linux-cachyos` coexists, Limine dual-boot |
+| Userspace PCODE-only control | **Not viable** — needs full driver path (see June findings below) |
+| Physical motherboard redirect | **Not needed** — software path works |
+
+**Guides:** [`docs/CUSTOM_KERNEL.md`](docs/CUSTOM_KERNEL.md) · [`docs/COOLERCONTROL.md`](docs/COOLERCONTROL.md) · [`docs/UPSTREAM_STATUS.md`](docs/UPSTREAM_STATUS.md)
+
+The sections below document the original research plan and June 2026 findings. They remain useful for understanding why raw PCODE probing failed and how the upstream patch differs.
+
+---
+
 ## 0. Executive Summary of Findings
 
 ### Hardware & System Context
@@ -313,8 +331,8 @@ XeDriver_FanPatch/
 │   │   └── xe_fanctl.service      # Systemd service file
 │   │
 │   ├── patch/
-│   │   ├── xe_hwmon.c.patched     # Patched xe_hwmon.c
-│   │   └── xe_hwmon.patch         # Unified diff patch
+│   │   ├── xe_hwmon.c.patched                              # Early reference patch
+│   │   └── xe-fan-control-168027-cachyos-7.1.2.patch       # Working CachyOS 7.1.2 patch
 │   │
 │   ├── fallback/
 │   │   ├── identify_headers.sh    # Motherboard PWM header scanner
@@ -327,6 +345,7 @@ XeDriver_FanPatch/
 │       └── fan_control_8086_e20b_8086_1100.bin  # Copy of firmware blob
 │
 ├── reference/
+│   ├── series-168027-fan-control.mbox   # Intel upstream patch series (mbox)
 │   ├── xe_hwmon.c                 # Original upstream source (reference)
 │   ├── xe_pcode.c                 # Original upstream source (reference)
 │   ├── xe_pcode.h                 # Original upstream source (reference)
@@ -335,6 +354,11 @@ XeDriver_FanPatch/
 │   └── xe_hwmon.h                 # Original upstream source (reference)
 │
 └── docs/
+    ├── CUSTOM_KERNEL.md           # Build, install, verify, rollback
+    ├── COOLERCONTROL.md           # CoolerControl setup and fail-safe
+    ├── UPSTREAM_STATUS.md         # Series 168027 merge status
+    ├── GITHUB_ISSUE_COMMENT.md    # Template for compute-runtime #885
+    ├── TESTING_RESULTS.md         # June + July 2026 test logs
     ├── REGISTER_MAP.md            # Complete register documentation
     ├── PCODE_PROTOCOL.md          # PCODE mailbox protocol documentation
     └── FIRMWARE_ANALYSIS.md       # Firmware blob analysis report
@@ -357,7 +381,18 @@ XeDriver_FanPatch/
 
 ## 6. Success Criteria
 
-1. **Minimum viable**: Userspace probe tool successfully reads fan RPM, temperature, and probes FSC subcommands
-2. **Partial success**: A valid FSC read subcommand is found that returns fan duty/speed data
-3. **Full success**: A valid FSC write subcommand is found that controls fan speed, integrated into the daemon
-4. **Fallback success**: Physical fan redirect is documented and configured, working with coolercontrol
+1. **Minimum viable**: Userspace probe tool successfully reads fan RPM, temperature, and probes FSC subcommands — **achieved June 2026**
+2. **Partial success**: A valid FSC read subcommand is found that returns fan duty/speed data — **achieved June 2026**
+3. **Full success**: Writable fan control via kernel driver — **achieved July 2026** via series 168027 custom kernel + CoolerControl (not userspace PCODE alone)
+4. **Fallback success**: Physical fan redirect documented — **available but not required**
+
+## 7. Post-Resolution Artifacts
+
+| Artifact | Location |
+|----------|----------|
+| Adapted CachyOS 7.1.2 patch | `src/patch/xe-fan-control-168027-cachyos-7.1.2.patch` |
+| Original Intel mbox series | `reference/series-168027-fan-control.mbox` |
+| Build / install / rollback guide | `docs/CUSTOM_KERNEL.md` |
+| CoolerControl + fail-safe | `docs/COOLERCONTROL.md` |
+| Upstream merge tracking | `docs/UPSTREAM_STATUS.md` |
+| Verified test log | `docs/TESTING_RESULTS.md` (July 2026 section) |

@@ -1,6 +1,6 @@
 [Unit]
 Description=Intel Arc B580 Fan Control Daemon
-Documentation=https://github.com/YOUR_USERNAME/XeDriver_FanPatch
+Documentation=https://github.com/PerkyZZ999/XeDriver_FanPatch
 After=graphical.target
 Wants=graphical.target
 

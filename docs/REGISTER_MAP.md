@@ -1,5 +1,7 @@
 # Intel Arc B580 Register Map
 
+> **Note (July 2026):** Writable fan control is available through the patched kernel's hwmon interface (`pwm1`), not direct BAR0 userspace access. Register map below documents June 2026 research.
+
 ## PCI Configuration
 
 | Field | Value |

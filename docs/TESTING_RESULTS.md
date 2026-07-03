@@ -1,36 +1,88 @@
 # Testing Results & Findings
 
-## Test Date: June 19, 2026
+## July 3, 2026 — Fan Control Working (Custom Kernel)
 
-## System Under Test
+### System Under Test
+- **GPU**: Intel Arc B580, ASRock Challenger, PCI `0000:09:00.0` (`8086:e20b`)
+- **Kernel**: `7.1.2-1-cachyos-xefan` (custom build from CachyOS 7.1.2-3 + series 168027 patch)
+- **Stock kernel kept**: `7.1.2-3-cachyos` (rollback via Limine)
+- **Bootloader**: Limine 12.3.3
+- **Fan UI**: CoolerControl 4.3.1
+
+### Result: SUCCESS
+
+| Test | Result |
+|------|--------|
+| Boot xefan kernel | Pass |
+| `pwm1`, `pwm1_enable`, `fan1_max` in xe hwmon | Present |
+| `pwm1_auto_point[1-10]_*` curve attrs | Present |
+| Manual PWM sysfs test | Fan RPM responds to `pwm1` writes |
+| CoolerControl Fixed % (50%, 100%) | Fan speed matches setpoint |
+| CoolerControl device status | **Unmanaged** (not Read-Only) |
+| Stock auto curve on boot | `pwm1_enable=2`, ~10% idle floor |
+
+### xe hwmon Path
+`/sys/class/hwmon/hwmon2/` (name=`xe`)
+
+### Stock Auto Curve (read from sysfs)
+
+| Point | Temp | PWM (0–255) |
+|-------|------|-------------|
+| 1 | 10°C | 26 |
+| 2 | 50°C | 26 |
+| 3 | 55°C | 51 |
+| 4 | 70°C | 77 |
+| 5 | 75°C | 102 |
+| 6 | 79°C | 128 |
+| 7 | 85°C | 153 |
+| 8 | 90°C | 204 |
+| 9 | 95°C | 230 |
+| 10 | 100°C | 255 |
+
+### Solution Used
+
+Intel patch series **168027** applied to CachyOS `linux-cachyos` PKGBUILD as side-by-side package `linux-cachyos-xefan`. See [`CUSTOM_KERNEL.md`](CUSTOM_KERNEL.md).
+
+### Fail-Safe Notes
+
+- Driver boots in auto mode (stock firmware table)
+- `pwm1_enable=0` = full speed, not off
+- CoolerControl crash → fan holds last PWM, not 0%
+- See [`COOLERCONTROL.md`](COOLERCONTROL.md)
+
+---
+
+## June 19, 2026 — PCODE Probing (Stock Kernel)
+
+### System Under Test
 - **GPU**: Intel Arc B580 (Battlemage G21), PCI 0000:09:00.0 (8086:e20b)
 - **Kernel**: 7.0.12-1-cachyos (CachyOS, clang 22.1.6)
 - **Driver**: xe v1.1.0, mei_lb bound
 - **Firmware**: fan_control_8086_e20b_8086_1100.bin present in /lib/firmware/xe/
 
-## Test Results Summary
+### Test Results Summary
 
-### Step 1: Userspace PCODE Probe (SUCCESS)
+#### Step 1: Userspace PCODE Probe (SUCCESS)
 - BAR0 mapped successfully at 16MB
 - PCODE mailbox responsive, no errors
 - Fan count: 1
 - Fan RPM: ~1000 RPM at 34°C idle
 - Thermal limits: shutdown=125°C, critical=100°C
 
-### Step 2: Kernel Module (SUCCESS)
+#### Step 2: Kernel Module (SUCCESS)
 - Module loaded/unloaded cleanly
 - Sysfs attributes readable
 - Fan RPM and temperature readings correct
 - No kernel panics or driver conflicts
 
-### Step 3: Daemon Dry Run (SUCCESS)
+#### Step 3: Daemon Dry Run (SUCCESS)
 - Auto-detected userspace control method
 - Temperature reading from hwmon2 working
 - Fan curve interpolation correct
 
-### Step 4: PCODE Mailbox Write Probing (SUCCESS — but no fan control achieved)
+#### Step 4: PCODE Mailbox Write Probing (SUCCESS — but no fan control achieved)
 
-## FAN_SPEED_CONTROL (0x7D) Subcommand Map (Confirmed)
+### FAN_SPEED_CONTROL (0x7D) Subcommand Map (Confirmed)
 
 | Subcmd | Read | Write | Accepted Values | Fan Changed? | Purpose |
 |---|---|---|---|---|---|
@@ -45,49 +97,21 @@
 | 0x9 | OK (returns 1) | 1 accepted, 0 rejected | 1 only | No | Read-only flag (auto mode) |
 | 0xa-0xf | Rejected | N/A | N/A | No | Do not exist |
 
-## Critical Finding: Firmware Not Provisioned
+### June Finding: Userspace Writes Insufficient
 
 ```
 V1_FAN_SUPPORTED:      YES
 V1_FAN_PROVISIONED:    NO
 Fan FW Version:        0.0.0.0
-VR FW Version:         0.0.0.0
 ```
 
-The fan control firmware blob (`fan_control_8086_e20b_8086_1100.bin`) exists on disk and the `mei_lb` driver binds to the xe device, but the firmware is **never actually loaded into the PUnit**. The xe driver's late binding code (`xe_late_bind_fw.c`) runs but provisioning fails silently.
+PCODE accepted `FAN_SPEED_CONTROL` writes but had **no driver integration path** on stock 7.0.12. The July 2026 kernel patch (series 168027) provides that path — fan control works without requiring userspace mailbox poking.
 
-### Why Software Fan Control Doesn't Work
+### Revised Conclusion
 
-Without the firmware provisioned:
-1. PCODE accepts FAN_SPEED_CONTROL commands but **has no firmware backend to execute them**
-2. Subcmd 0x1 accepts duty writes (0x01-0xFF) but does nothing — no consumer
-3. Subcmd 0x8 mode toggle doesn't persist — no firmware state machine
-4. The fan runs on a **hardware default curve** in the PUnit ROM
+- **Stock kernel**: fan control not available via sysfs or userspace PCODE alone
+- **Patched kernel (series 168027)**: full hwmon fan control working
+- **Physical redirect**: no longer required if custom kernel is acceptable
 
-### Root Cause (Likely)
-
-The CachyOS kernel (7.0.12) is based on a kernel version where the late binding firmware loading infrastructure exists but may not be fully functional for Battlemage. The `xe_late_bind_fw.c` code is present in the module, but the firmware provisioning path may require a newer kernel version or additional patches not yet in CachyOS.
-
-## Conclusion
-
-**Software fan control via PCODE mailbox is not achievable on this system** until the late binding firmware is properly provisioned. This requires an upstream kernel update that fully implements the firmware loading path for Battlemage.
-
-### What to Watch For
-- CachyOS kernel updates (check `lb_fan_control_version` after updates — when it shows a non-zero version, the firmware is loaded)
-- Upstream xe driver commits to `xe_late_bind_fw.c`
-- Intel-xe mailing list for late binding provisioning fixes
-- When V1_FAN_PROVISIONED becomes YES, re-run the probe tools in this project
-
-### When Firmware IS Provisioned (Future)
-Once `lb_fan_control_version` shows a real version:
-1. Re-run `sudo ./src/userspace/xe_pcode_probe --all`
-2. Re-test subcmd 0x1 writes — they may now actually control the fan
-3. Load the kernel module and test `pwm1` sysfs writes
-4. If subcmd 0x1 controls the fan, configure the daemon for automatic control
-
-### Immediate Options
-- **Wait for upstream** (recommended — safest, just needs a kernel update)
-- **Physical fan redirect** (documented in `src/fallback/HARDWARE_GUIDE.md` — works today but requires hardware modification)
-
-## Safety Note
-The testing was safe — no permanent damage occurred. All PCODE state is volatile and resets on reboot. The one display crash was caused by a PCI driver remove/rescan (avoid this on primary display GPUs).
+### Safety Note
+June testing was safe — no permanent damage. The one display crash was caused by PCI driver remove/rescan (avoid on primary display GPUs).

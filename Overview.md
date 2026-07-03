@@ -1,5 +1,7 @@
 # SPEC.md: Intel Arc B580 Linux Fan Control Implementation Project
 
+> **Status (July 2026):** Fan control **works** on Arc B580 with Intel patch series 168027 on a custom `linux-cachyos-xefan` kernel. CoolerControl manages `pwm1` via xe hwmon. See [`docs/CUSTOM_KERNEL.md`](docs/CUSTOM_KERNEL.md).
+
 ## 1. Executive Summary & Core Problem Space
 
 The **Intel Arc B580 (Battlemage)** GPU delivers excellent compute and graphics performance on Linux via the modern native **`xe` kernel driver**. However, user-space fan speed customization is currently broken or unimplemented upstream. While metrics like GPU temperature and fan RPM are readable through the kernel's hardware monitoring subsystem (`hwmon`), the ability to modify fan curves or force manual PWM targets is completely missing.

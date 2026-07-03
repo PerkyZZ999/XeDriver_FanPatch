@@ -1,6 +1,6 @@
 # Publishing to GitHub
 
-The repository is prepared for a public release. Follow these steps:
+The repository is prepared for public release. Follow these steps:
 
 ## 1. Create the GitHub repository
 
@@ -13,36 +13,30 @@ Do **not** initialize with a README if you already have one locally.
 ```bash
 cd /path/to/XeDriver_FanPatch
 
-git init
 git add .
 git status   # verify no build artifacts (*.ko, xe_pcode_probe binary, watch_data.json)
 git commit -m "$(cat <<'EOF'
-Initial public release: Intel Arc B580 Linux fan control research.
+Document working B580 fan control via series 168027 custom kernel.
 
-Documents PCODE mailbox probing, late-binding firmware analysis, and
-tools for when upstream xe driver fan control is completed.
+Adds CachyOS-adapted patch, build/rollback guides, CoolerControl setup,
+fail-safe notes, and July 2026 verification results.
 EOF
 )"
 git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/XeDriver_FanPatch.git
+git remote add origin https://github.com/PerkyZZ999/XeDriver_FanPatch.git
 git push -u origin main
 ```
 
-## 3. Update placeholder URLs
+## 3. GitHub release tag
 
-After pushing, replace `YOUR_USERNAME` in:
-
-- `src/daemon/xe_fanctl.service` (`Documentation=` line)
-- Any issue posts that reference the repo
-
-## 4. Optional: GitHub release
-
-Tag the initial research snapshot:
+Tag the working-fan-control milestone:
 
 ```bash
-git tag -a v0.1.0-research -m "Research snapshot — fan control not yet working upstream"
-git push origin v0.1.0-research
+git tag -a v0.2.0-xefan-working -m "Fan control verified — series 168027 on linux-cachyos-xefan"
+git push origin v0.2.0-xefan-working
 ```
+
+Previous research-only tag (if published): `v0.1.0-research`
 
 ## What is excluded from git
 
@@ -51,25 +45,33 @@ See [`.gitignore`](.gitignore):
 - Compiled binaries (`xe_pcode_probe`, `xe_fan_probe.ko`)
 - Kernel module build artifacts
 - `src/monitor/watch_data.json` (local monitoring history)
+- Local kernel build trees (`/mnt/data-z/kernel-build/` — build on your machine)
 
-## Posting to Intel
+## Posting to Intel / community
 
-1. Comment on [compute-runtime #885](https://github.com/intel/compute-runtime/issues/885) with your short intro (see issue draft in chat).
-2. Follow up with the full technical write-up, linking your repo.
-3. Consider cross-posting to [drm/xe GitLab](https://gitlab.freedesktop.org/drm/xe/kernel/-/issues) — late-binding provisioning is kernel-side work.
+1. Comment on [compute-runtime #885](https://github.com/intel/compute-runtime/issues/885) — template in [`docs/GITHUB_ISSUE_COMMENT.md`](docs/GITHUB_ISSUE_COMMENT.md)
+2. Link repo: https://github.com/PerkyZZ999/XeDriver_FanPatch
+3. Optional: cross-post to [drm/xe GitLab issues](https://gitlab.freedesktop.org/drm/xe/kernel/-/issues)
 
-## Systemd install (optional)
+## Key docs for new visitors
+
+| Doc | Audience |
+|-----|----------|
+| [`README.md`](README.md) | Overview and quick links |
+| [`docs/CUSTOM_KERNEL.md`](docs/CUSTOM_KERNEL.md) | Build and install patched kernel |
+| [`docs/COOLERCONTROL.md`](docs/COOLERCONTROL.md) | Daily fan management |
+| [`docs/TESTING_RESULTS.md`](docs/TESTING_RESULTS.md) | Proof it works |
+
+## Systemd install (optional — legacy daemon)
+
+The `xe_fanctl` daemon is **not required** when using CoolerControl + patched kernel. If you still want it:
 
 ```bash
 sudo mkdir -p /opt/xe-fan-patch
 sudo cp -a . /opt/xe-fan-patch/
-# Edit INSTALL_ROOT in src/daemon/xe_fanctl.service if not using /opt/xe-fan-patch
 sudo cp src/daemon/xe_fanctl.service /etc/systemd/system/
 sudo systemctl daemon-reload
-```
-
-Build the userspace probe before enabling the daemon:
-
-```bash
 make -C /opt/xe-fan-patch/src/userspace
 ```
+
+CoolerControl is the recommended control path on the xefan kernel.

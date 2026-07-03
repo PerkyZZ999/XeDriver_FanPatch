@@ -1,5 +1,7 @@
 # PCODE Mailbox Protocol Documentation
 
+> **Note (July 2026):** Fan control works via kernel patch series 168027 (`xe_pcode_write` through the driver), not userspace mailbox poking. This document remains useful for understanding the protocol explored in June 2026.
+
 ## Overview
 
 The PCODE (Platform Code) firmware is a low-level microcontroller embedded in Intel GPUs that handles power management, thermal control, and fan regulation. The xe kernel driver communicates with PCODE via a **mailbox mechanism** — a set of MMIO registers that implement a request/response protocol.

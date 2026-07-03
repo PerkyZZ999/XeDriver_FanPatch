@@ -1,5 +1,7 @@
 # Firmware Blob Analysis: fan_control_8086_e20b_8086_1100.bin
 
+> **Note (July 2026):** With patch series 168027, the driver reads the stock fan table from PCODE/firmware and exposes it via `pwm1_auto_point*` sysfs. Modifying the blob is not required for fan control.
+
 ## Overview
 
 The Intel Arc B580's fan controller firmware is loaded via the MEI Late Binding mechanism during the xe driver's probe sequence. The firmware blob contains the fan curve that the GPU's PUnit/PCODE firmware uses to control fan speed automatically.

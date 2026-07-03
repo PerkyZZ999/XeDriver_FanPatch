@@ -1,5 +1,7 @@
 # Hardware Guide: Physical Fan Cable Redirect Fallback
 
+> **Status (July 2026):** This fallback is **no longer required** if you can run the patched kernel ([`docs/CUSTOM_KERNEL.md`](../../docs/CUSTOM_KERNEL.md)). Keep this guide as a last resort for stock-kernel-only systems or if software control fails on your board.
+
 ## Overview
 
 Intel Arc B580 (Battlemage) fan control is **firmware-gated**. The `xe` kernel
